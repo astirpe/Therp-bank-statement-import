@@ -10,7 +10,7 @@ from html import escape
 from dateutil.relativedelta import MO, relativedelta
 from pytz import timezone, utc
 
-from odoo import SUPERUSER_ID, _, api, fields, models
+from odoo import _, api, fields, models
 
 from odoo.addons.base.models.res_bank import sanitize_account_number
 from odoo.addons.base.models.res_partner import _tz_get
@@ -24,7 +24,7 @@ class OnlineBankStatementProvider(models.Model):
     _description = "Online Bank Statement Provider"
 
     company_id = fields.Many2one(related="journal_id.company_id", store=True)
-    active = fields.Boolean()
+    active = fields.Boolean(default=True)
     name = fields.Char(string="Name", compute="_compute_name", store=True)
     journal_id = fields.Many2one(
         comodel_name="account.journal",
@@ -88,6 +88,7 @@ class OnlineBankStatementProvider(models.Model):
     certificate_public_key = fields.Text()
     certificate_private_key = fields.Text()
     certificate_chain = fields.Text()
+    allow_empty_statements = fields.Boolean(string="Allow empty statements")
 
     _sql_constraints = [
         (
@@ -115,12 +116,11 @@ class OnlineBankStatementProvider(models.Model):
     def values_service(self):
         return self._get_available_services()
 
-    @api.depends("service")
+    @api.depends("service", "journal_id.name")
     def _compute_name(self):
+        """We can have multiple providers/journals for the same service."""
         for provider in self:
-            provider.name = list(
-                filter(lambda x: x[0] == provider.service, self._selection_service())
-            )[0][1]
+            provider.name = " ".join([provider.journal_id.name, provider.service])
 
     @api.depends("active", "interval_type", "interval_number")
     def _compute_update_schedule(self):
@@ -139,16 +139,9 @@ class OnlineBankStatementProvider(models.Model):
                 )[0][1],
             }
 
-    def _pull(self, date_since, date_until):  # noqa: C901
-        AccountBankStatement = self.env["account.bank.statement"]
+    def _pull(self, date_since, date_until):
         is_scheduled = self.env.context.get("scheduled")
-        if is_scheduled:
-            AccountBankStatement = AccountBankStatement.with_context(
-                tracking_disable=True,
-            )
-        AccountBankStatementLine = self.env["account.bank.statement.line"]
         for provider in self:
-            provider_tz = timezone(provider.tz) if provider.tz else utc
             statement_date_since = provider._get_statement_date_since(date_since)
             while statement_date_since < date_until:
                 statement_date_until = (
@@ -185,106 +178,124 @@ class OnlineBankStatementProvider(models.Model):
                         )
                         break
                     raise
-                statement_date = provider._get_statement_date(
-                    statement_date_since, statement_date_until,
+                provider._create_or_update_statement(
+                    data, statement_date_since, statement_date_until
                 )
-                if not data:
-                    data = ([], {})
-                lines_data, statement_values = data
-                if not lines_data:
-                    lines_data = []
-                if not statement_values:
-                    statement_values = {}
-                statement = AccountBankStatement.search(
-                    [
-                        ("journal_id", "=", provider.journal_id.id),
-                        ("state", "=", "open"),
-                        ("date", "=", statement_date),
-                    ],
-                    limit=1,
-                )
-                if not statement:
-                    statement_values.update(
-                        {
-                            "name": provider.journal_id.sequence_id.with_context(
-                                ir_sequence_date=statement_date,
-                            ).next_by_id(),
-                            "journal_id": provider.journal_id.id,
-                            "date": statement_date,
-                        }
-                    )
-                    statement = AccountBankStatement.with_context(
-                        journal_id=provider.journal_id.id,
-                    ).create(
-                        # NOTE: This is needed since create() alters values
-                        statement_values.copy()
-                    )
-                filtered_lines = []
-                for line_values in lines_data:
-                    date = line_values["date"]
-                    if not isinstance(date, datetime):
-                        date = fields.Datetime.from_string(date)
-
-                    if date.tzinfo is None:
-                        date = date.replace(tzinfo=utc)
-                    date = date.astimezone(utc).replace(tzinfo=None)
-
-                    if date < statement_date_since:
-                        if "balance_start" in statement_values:
-                            statement_values["balance_start"] = Decimal(
-                                statement_values["balance_start"]
-                            ) + Decimal(line_values["amount"])
-                        continue
-                    elif date >= statement_date_until:
-                        if "balance_end_real" in statement_values:
-                            statement_values["balance_end_real"] = Decimal(
-                                statement_values["balance_end_real"]
-                            ) - Decimal(line_values["amount"])
-                        continue
-
-                    date = date.replace(tzinfo=utc)
-                    date = date.astimezone(provider_tz).replace(tzinfo=None)
-                    line_values["date"] = date
-
-                    unique_import_id = line_values.get("unique_import_id")
-                    if unique_import_id:
-                        unique_import_id = provider._generate_unique_import_id(
-                            unique_import_id
-                        )
-                        line_values.update({"unique_import_id": unique_import_id})
-                        if AccountBankStatementLine.with_user(SUPERUSER_ID).search(
-                            [("unique_import_id", "=", unique_import_id)], limit=1
-                        ):
-                            continue
-
-                    bank_account_number = line_values.get("account_number")
-                    if bank_account_number:
-                        line_values.update(
-                            {
-                                "account_number": (
-                                    self._sanitize_bank_account_number(
-                                        bank_account_number
-                                    )
-                                ),
-                            }
-                        )
-
-                    filtered_lines.append(line_values)
-                statement_values.update(
-                    {"line_ids": [[0, False, line] for line in filtered_lines]}
-                )
-                if "balance_start" in statement_values:
-                    statement_values["balance_start"] = float(
-                        statement_values["balance_start"]
-                    )
-                if "balance_end_real" in statement_values:
-                    statement_values["balance_end_real"] = float(
-                        statement_values["balance_end_real"]
-                    )
-                statement.write(statement_values)
                 statement_date_since = statement_date_until
             if is_scheduled:
                 provider._schedule_next_run()
+
+    def _create_or_update_statement(
+        self, data, statement_date_since, statement_date_until
+    ):
+        """Create or update bank statement with the data retrieved from provider."""
+        self.ensure_one()
+        AccountBankStatement = self.env["account.bank.statement"]
+        is_scheduled = self.env.context.get("scheduled")
+        if is_scheduled:
+            AccountBankStatement = AccountBankStatement.with_context(
+                tracking_disable=True,
+            )
+        if not data:
+            data = ([], {})
+        if not data[0] and not data[1] and not self.allow_empty_statements:
+            return
+        lines_data, statement_values = data
+        if not lines_data:
+            lines_data = []
+        if not statement_values:
+            statement_values = {}
+        statement_date = self._get_statement_date(
+            statement_date_since, statement_date_until,
+        )
+        statement = AccountBankStatement.search(
+            [
+                ("journal_id", "=", self.journal_id.id),
+                ("state", "=", "open"),
+                ("date", "=", statement_date),
+            ],
+            limit=1,
+        )
+        if not statement:
+            statement_values.update(
+                {
+                    "name": self.journal_id.sequence_id.with_context(
+                        ir_sequence_date=statement_date,
+                    ).next_by_id(),
+                    "journal_id": self.journal_id.id,
+                    "date": statement_date,
+                }
+            )
+            statement = AccountBankStatement.with_context(
+                journal_id=self.journal_id.id,
+            ).create(
+                # NOTE: This is needed since create() alters values
+                statement_values.copy()
+            )
+        filtered_lines = self._get_filtered_lines(
+            statement_date_since, statement_date_until, statement_values, lines_data
+        )
+        statement_values.update(
+            {"line_ids": [[0, False, line] for line in filtered_lines]}
+        )
+        if "balance_start" in statement_values:
+            statement_values["balance_start"] = float(statement_values["balance_start"])
+        if "balance_end_real" in statement_values:
+            statement_values["balance_end_real"] = float(
+                statement_values["balance_end_real"]
+            )
+        statement.write(statement_values)
+
+    def _get_filtered_lines(
+        self, statement_date_since, statement_date_until, statement_values, lines_data
+    ):
+        """Filter and update line data."""
+        filtered_lines = []
+        AccountBankStatementLine = self.env["account.bank.statement.line"]
+        for line_values in lines_data:
+            date = line_values["date"]
+            if not isinstance(date, datetime):
+                date = fields.Datetime.from_string(date)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=utc)
+            date = date.astimezone(utc).replace(tzinfo=None)
+
+            if date < statement_date_since:
+                if "balance_start" in statement_values:
+                    statement_values["balance_start"] = Decimal(
+                        statement_values["balance_start"]
+                    ) + Decimal(line_values["amount"])
+                continue
+            elif date >= statement_date_until:
+                if "balance_end_real" in statement_values:
+                    statement_values["balance_end_real"] = Decimal(
+                        statement_values["balance_end_real"]
+                    ) - Decimal(line_values["amount"])
+                continue
+
+            date = date.replace(tzinfo=utc)
+            date = date.astimezone(self.tz).replace(tzinfo=None)
+            line_values["date"] = date
+
+            unique_import_id = line_values.get("unique_import_id")
+            if unique_import_id:
+                unique_import_id = self._generate_unique_import_id(unique_import_id)
+                line_values.update({"unique_import_id": unique_import_id})
+                if AccountBankStatementLine.sudo().search(
+                    [("unique_import_id", "=", unique_import_id)], limit=1
+                ):
+                    continue
+
+            bank_account_number = line_values.get("account_number")
+            if bank_account_number:
+                line_values.update(
+                    {
+                        "account_number": (
+                            self._sanitize_bank_account_number(bank_account_number)
+                        ),
+                    }
+                )
+            filtered_lines.append(line_values)
 
     def _schedule_next_run(self):
         self.ensure_one()
